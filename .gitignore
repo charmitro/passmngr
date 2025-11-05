@@ -1,0 +1,26 @@
+# Rust build artifacts
+/target
+
+# Internal development docs
+CLAUDE.md
+DESIGN.md
+PRINCIPLES_AUDIT.md
+
+# Vault files (sensitive data)
+*.enc
+vault.enc
+
+# Export files (contain plaintext passwords)
+*.csv
+backup.json
+
+# Editor and IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test data
+/examples/test_vault/

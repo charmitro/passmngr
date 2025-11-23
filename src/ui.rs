@@ -11,15 +11,18 @@ use ratatui::{
 
 /// Truncate string to fit within max_width, adding "..." if truncated
 fn truncate_string(s: &str, max_width: usize) -> String {
-    let len = s.len();
-    let needs_truncate = (len > max_width) as usize;
-    let is_tiny = (max_width <= 3) as usize;
-    let strategy = needs_truncate * (1 + is_tiny);
+    let char_count = s.chars().count();
+    let needs_truncate = char_count > max_width;
 
-    match strategy {
-        0 => format!("{:<width$}", s, width = max_width),
-        1 => format!("{}...", &s[..max_width - 3]),
-        _ => ".".repeat(max_width),
+    if needs_truncate {
+        if max_width <= 3 {
+            ".".repeat(max_width)
+        } else {
+            let truncated: String = s.chars().take(max_width - 3).collect();
+            format!("{}...", truncated)
+        }
+    } else {
+        format!("{:<width$}", s, width = max_width)
     }
 }
 
@@ -63,6 +66,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
                     Mode::Search => Color::Blue,
                     Mode::Command => Color::Magenta,
                     Mode::Detail => Color::Cyan,
+                    Mode::Locked => Color::Red,
                 })
                 .add_modifier(Modifier::BOLD),
         ),
@@ -110,8 +114,47 @@ fn render_main_content(f: &mut Frame, app: &mut App, area: Rect) {
     match app.mode {
         Mode::Insert => render_form_view(f, app, area),
         Mode::Detail => render_detail_view(f, app, area),
+        Mode::Locked => render_locked_view(f, app, area),
         _ => render_list_view(f, app, area),
     }
+}
+
+/// Render the locked view
+fn render_locked_view(f: &mut Frame, app: &mut App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(Style::default().bg(Color::Red));
+
+    let inner_area = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(40),
+            Constraint::Length(3),
+            Constraint::Percentage(40),
+        ])
+        .split(inner_area);
+
+    let title = Paragraph::new(vec![
+        Line::from(Span::styled(
+            "🔒 VAULT LOCKED",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from("Session timed out due to inactivity."),
+    ])
+    .alignment(Alignment::Center);
+
+    f.render_widget(title, chunks[0]);
+
+    let input = Paragraph::new(format!("Password: {}", "*".repeat(app.unlock_input.len())))
+        .style(Style::default().fg(Color::White))
+        .block(Block::default().borders(Borders::ALL).title("Unlock"));
+
+    f.render_widget(input, chunks[1]);
 }
 
 /// Render the list of entries
@@ -130,8 +173,8 @@ fn render_list_view(f: &mut Frame, app: &mut App, area: Rect) {
         .filtered_entries
         .iter()
         .enumerate()
-        .map(|(i, id)| {
-            let entry = app.vault.get_entry(id).unwrap();
+        .filter_map(|(i, id)| {
+            let entry = app.vault.get_entry(id)?;
             let is_selected = i == app.selected;
 
             let tags_str = if entry.tags.is_empty() {
@@ -165,11 +208,11 @@ fn render_list_view(f: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(tags_display, Style::default().fg(Color::Blue)),
             ]);
 
-            ListItem::new(line).style(if is_selected {
+            Some(ListItem::new(line).style(if is_selected {
                 Style::default().bg(Color::DarkGray)
             } else {
                 Style::default()
-            })
+            }))
         })
         .collect();
 
@@ -205,7 +248,11 @@ fn render_detail_view(f: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         Line::from(vec![
             Span::styled("Password: ", Style::default().fg(Color::Cyan)),
-            Span::raw("*".repeat(entry.password.len())),
+            if app.show_password {
+                Span::raw(&entry.password)
+            } else {
+                Span::raw("*".repeat(entry.password.len()))
+            },
         ]),
         Line::from(""),
     ];
@@ -289,11 +336,12 @@ fn render_form_view(f: &mut Frame, app: &App, area: Rect) {
         let label = field.as_str();
         let value = app.get_field_value(*field);
 
-        let display_value = if field == &FormField::Password && !value.is_empty() {
-            "*".repeat(value.len())
-        } else {
-            value.to_string()
-        };
+        let display_value =
+            if field == &FormField::Password && !value.is_empty() && !app.show_password {
+                "*".repeat(value.len())
+            } else {
+                value.to_string()
+            };
 
         lines.push(Line::from(vec![
             Span::styled(
@@ -326,6 +374,10 @@ fn render_form_view(f: &mut Frame, app: &App, area: Rect) {
         Span::raw(" Next/Prev field  "),
         Span::styled("Ctrl+S:", Style::default().fg(Color::Green)),
         Span::raw(" Save  "),
+        Span::styled("Ctrl+P:", Style::default().fg(Color::Green)),
+        Span::raw(" Show/Hide  "),
+        Span::styled("Ctrl+G:", Style::default().fg(Color::Green)),
+        Span::raw(" Generate  "),
         Span::styled("Esc:", Style::default().fg(Color::Green)),
         Span::raw(" Cancel"),
     ]));
@@ -341,6 +393,12 @@ fn render_form_view(f: &mut Frame, app: &App, area: Rect) {
 /// Render the footer with help text or command buffer
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let content = match app.mode {
+        Mode::Locked => Line::from(vec![
+            Span::styled("Enter:", Style::default().fg(Color::White)),
+            Span::raw(" Unlock  "),
+            Span::styled("Esc/q:", Style::default().fg(Color::White)),
+            Span::raw(" Quit"),
+        ]),
         Mode::Command => {
             let mut spans = vec![
                 Span::styled(":", Style::default().fg(Color::Magenta)),
@@ -360,13 +418,15 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
 
             Line::from(spans)
         }
-        Mode::Search => Line::from(vec![
-            Span::styled("Enter:", Style::default().fg(Color::Green)),
-            Span::raw("keep filter  "),
-            Span::styled("Esc:", Style::default().fg(Color::Green)),
-            Span::raw("clear filter  "),
-            Span::styled("Backspace:", Style::default().fg(Color::Green)),
-            Span::raw("delete char"),
+        Mode::Detail => Line::from(vec![
+            Span::styled("Esc/q:", Style::default().fg(Color::Green)),
+            Span::raw("back  "),
+            Span::styled("e:", Style::default().fg(Color::Green)),
+            Span::raw("edit  "),
+            Span::styled("y/Y:", Style::default().fg(Color::Green)),
+            Span::raw("copy pass/user  "),
+            Span::styled("v:", Style::default().fg(Color::Green)),
+            Span::raw("show/hide"),
         ]),
         _ => {
             if let Some(status) = &app.status_message {
@@ -402,4 +462,40 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         .alignment(Alignment::Left);
 
     f.render_widget(footer, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_string() {
+        assert_eq!(truncate_string("hello", 10), "hello     ");
+        assert_eq!(truncate_string("hello world", 5), "he...");
+        assert_eq!(truncate_string("hello", 3), "...");
+    }
+
+    #[test]
+    fn test_truncate_string_multibyte() {
+        // Each emoji is multiple bytes
+        let s = "😀😃😄😁😆";
+        // 5 chars.
+        // If max width is 10, it should pad.
+        assert_eq!(truncate_string(s, 10), "😀😃😄😁😆     ");
+
+        // If max width is 4, it should truncate to 1 char + ...
+        // 4 - 3 = 1 char.
+        assert_eq!(truncate_string(s, 4), "😀...");
+
+        // Test the specific panic case: slicing in middle of multibyte
+        // If we used byte slicing:
+        // s is ~20 bytes. max_width 7. 7-3 = 4 bytes.
+        // First emoji is 4 bytes. So it would work by luck if emoji is exactly 4 bytes.
+        // But let's use a char that is 3 bytes. "你" (U+4F60) is 3 bytes (E4 BD A0).
+        let s2 = "你好世界!";
+        // 5 chars. 15+1 bytes.
+        // max_width 4. 5 > 4 so truncate.
+        // keep 4-3 = 1 char.
+        assert_eq!(truncate_string(s2, 4), "你...");
+    }
 }

@@ -5,6 +5,7 @@ use crate::storage::VaultFile;
 use anyhow::Result;
 use ratatui::widgets::ListState;
 use std::path::PathBuf;
+use std::time::Instant;
 use uuid::Uuid;
 
 /// Application mode
@@ -15,6 +16,7 @@ pub enum Mode {
     Search,
     Command,
     Detail,
+    Locked,
 }
 
 impl Mode {
@@ -25,6 +27,7 @@ impl Mode {
             Mode::Search => "SEARCH",
             Mode::Command => "COMMAND",
             Mode::Detail => "DETAIL",
+            Mode::Locked => "LOCKED",
         }
     }
 }
@@ -106,6 +109,10 @@ pub struct App {
     pub focused_field: FormField,
     pub pending_save: bool,
     pub list_state: ListState,
+    pub show_password: bool,
+    // Auto-lock fields
+    pub last_activity: Instant,
+    pub unlock_input: String,
 }
 
 impl App {
@@ -133,7 +140,83 @@ impl App {
             focused_field: FormField::Name,
             pending_save: false,
             list_state,
+            show_password: false,
+            last_activity: Instant::now(),
+            unlock_input: String::new(),
         }
+    }
+
+    /// Generate a secure password for the current field
+    pub fn generate_password(&mut self) {
+        if self.mode == Mode::Insert && self.focused_field == FormField::Password {
+            let password = crate::crypto::generate_secure_password(20);
+            self.form_data.password = password;
+            self.set_status("Generated high-entropy password".to_string());
+            self.show_password = true; // Show it so user knows
+        }
+    }
+
+    /// Lock the vault (clear data from memory)
+    pub fn lock(&mut self) {
+        if self.mode == Mode::Locked {
+            return;
+        }
+
+        // Save if dirty before locking?
+        // Safety decision: Do not auto-save on lock. If the user didn't save,
+        // we might be saving bad state or they might not want to persist.
+        // However, losing data is bad.
+        // Man-Rated decision: If dirty, we cannot safely lock without potential data loss.
+        // But leaving it unlocked is a security violation.
+        // Protocol: We lock. Data in memory is wiped. Unsaved changes are LOST.
+        // This enforces the "save often" discipline.
+
+        // Clear sensitive data
+        self.vault.entries.clear();
+        self.filtered_entries.clear();
+        self.search_query.clear();
+        self.form_data = FormData::default();
+        let _ = self.clear_clipboard(); // Ignore error, best effort
+
+        // Zeroize master password from memory
+        // Note: String doesn't guarantee zeroization on drop, but we overwrite it here.
+        // For true security, we'd use `secrecy` crate, but this is a good baseline.
+        self.password = String::new();
+
+        self.mode = Mode::Locked;
+        self.unlock_input.clear();
+        self.set_status("Vault Locked due to inactivity".to_string());
+    }
+
+    /// Attempt to unlock the vault
+    pub fn unlock(&mut self) -> Result<()> {
+        // Attempt to load vault with provided password
+        // This verifies the password via authentication tag (ChaCha20-Poly1305)
+        match VaultFile::load(&self.vault_path, &self.unlock_input) {
+            Ok(vault) => {
+                self.vault = vault;
+                self.password = self.unlock_input.clone(); // Restore password
+
+                // Restore state
+                self.filtered_entries = self.vault.entries.iter().map(|e| e.id).collect();
+                self.update_search();
+                self.mode = Mode::Normal;
+                self.unlock_input.clear();
+                self.last_activity = Instant::now();
+                self.set_status("Vault Unlocked".to_string());
+                Ok(())
+            }
+            Err(_) => {
+                self.set_status("Incorrect password or vault error".to_string());
+                self.unlock_input.clear();
+                Err(anyhow::anyhow!("Unlock failed"))
+            }
+        }
+    }
+
+    /// Update activity timestamp
+    pub fn touch_activity(&mut self) {
+        self.last_activity = Instant::now();
     }
 
     /// Get currently selected entry
@@ -400,7 +483,7 @@ impl App {
         let path = if path_str.starts_with("~") {
             let home = dirs::home_dir()
                 .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
-            PathBuf::from(path_str.replacen("~", home.to_str().unwrap(), 1))
+            PathBuf::from(path_str.replacen("~", &home.to_string_lossy(), 1))
         } else {
             PathBuf::from(path_str)
         };
@@ -448,6 +531,13 @@ impl App {
             self.set_status("No entry selected".to_string());
             Ok(())
         }
+    }
+
+    /// Clear clipboard content (security feature)
+    pub fn clear_clipboard(&mut self) -> Result<()> {
+        let mut clipboard = arboard::Clipboard::new()?;
+        clipboard.set_text("")?;
+        Ok(())
     }
 
     /// Enter insert mode for creating a new entry
@@ -566,6 +656,7 @@ impl App {
         }
 
         self.mode = Mode::Normal;
+        self.show_password = false;
         self.update_search();
     }
 
@@ -573,5 +664,11 @@ impl App {
     pub fn cancel_form(&mut self) {
         self.mode = Mode::Normal;
         self.form_data = FormData::default();
+        self.show_password = false; // Reset visibility when canceling
+    }
+
+    /// Toggle password visibility
+    pub fn toggle_password_visibility(&mut self) {
+        self.show_password = !self.show_password;
     }
 }

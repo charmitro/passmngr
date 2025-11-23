@@ -48,6 +48,53 @@ use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+/// Generate a cryptographically secure random password
+///
+/// Uses a high-entropy character set:
+/// - Uppercase (A-Z)
+/// - Lowercase (a-z)
+/// - Numbers (0-9)
+/// - Special characters (!@#$%^&*)
+///
+/// Guarantees at least one character from each category for high density.
+pub fn generate_secure_password(len: usize) -> String {
+    const UPPER: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const LOWER: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+    const NUMBERS: &[u8] = b"0123456789";
+    const SPECIAL: &[u8] = b"!@#$%^&*-_=+";
+    const ALL: &[u8] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*-_=+";
+
+    if len < 4 {
+        // Fallback for tiny lengths (not recommended but handled)
+        use rand::Rng;
+        return (0..len)
+            .map(|_| ALL[OsRng.gen_range(0..ALL.len())] as char)
+            .collect();
+    }
+
+    // Ensure at least one of each type
+    use rand::seq::SliceRandom;
+    let mut password = Vec::with_capacity(len);
+    let mut rng = OsRng;
+
+    password.push(*UPPER.choose(&mut rng).unwrap());
+    password.push(*LOWER.choose(&mut rng).unwrap());
+    password.push(*NUMBERS.choose(&mut rng).unwrap());
+    password.push(*SPECIAL.choose(&mut rng).unwrap());
+
+    // Fill the rest
+    use rand::Rng;
+    for _ in 4..len {
+        password.push(ALL[rng.gen_range(0..ALL.len())]);
+    }
+
+    // Shuffle to remove pattern of first 4 chars
+    password.shuffle(&mut rng);
+
+    String::from_utf8(password).expect("Valid UTF-8")
+}
+
 /// Size of encryption key in bytes (256 bits)
 const KEY_SIZE: usize = 32;
 
@@ -71,7 +118,9 @@ impl KdfParams {
     /// Create new KDF parameters with recommended settings
     pub fn new() -> Result<Self> {
         let mut salt = vec![0u8; SALT_SIZE];
-        OsRng.fill_bytes(&mut salt);
+        OsRng
+            .try_fill_bytes(&mut salt)
+            .map_err(|e| anyhow!("Failed to generate salt: {}", e))?;
 
         Ok(Self {
             algorithm: "argon2id".to_string(),
@@ -87,12 +136,6 @@ impl KdfParams {
     }
 }
 
-impl Default for KdfParams {
-    fn default() -> Self {
-        Self::new().expect("Failed to generate KDF parameters")
-    }
-}
-
 /// Cipher parameters stored with the vault
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CipherParams {
@@ -102,20 +145,16 @@ pub struct CipherParams {
 
 impl CipherParams {
     /// Create new cipher parameters with random nonce
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self> {
         let mut nonce = vec![0u8; NONCE_SIZE];
-        OsRng.fill_bytes(&mut nonce);
+        OsRng
+            .try_fill_bytes(&mut nonce)
+            .map_err(|e| anyhow!("Failed to generate nonce: {}", e))?;
 
-        Self {
+        Ok(Self {
             algorithm: "chacha20poly1305".to_string(),
             nonce,
-        }
-    }
-}
-
-impl Default for CipherParams {
-    fn default() -> Self {
-        Self::new()
+        })
     }
 }
 
@@ -213,7 +252,7 @@ mod tests {
         let key = EncryptionKey::derive("test_password", &params).unwrap();
 
         let plaintext = b"Hello, World!";
-        let cipher_params = CipherParams::new();
+        let cipher_params = CipherParams::new().unwrap();
 
         let ciphertext = key.encrypt(plaintext, &cipher_params).unwrap();
         assert_ne!(&ciphertext[..], plaintext);
@@ -229,7 +268,7 @@ mod tests {
         let key2 = EncryptionKey::derive("password2", &params).unwrap();
 
         let plaintext = b"Secret data";
-        let cipher_params = CipherParams::new();
+        let cipher_params = CipherParams::new().unwrap();
 
         let ciphertext = key1.encrypt(plaintext, &cipher_params).unwrap();
 
@@ -244,7 +283,7 @@ mod tests {
         let key = EncryptionKey::derive("test_password", &params).unwrap();
 
         let plaintext = b"Sensitive data";
-        let cipher_params = CipherParams::new();
+        let cipher_params = CipherParams::new().unwrap();
 
         let mut ciphertext = key.encrypt(plaintext, &cipher_params).unwrap();
 
@@ -256,5 +295,21 @@ mod tests {
         // Decryption should fail due to authentication tag
         let result = key.decrypt(&ciphertext, &cipher_params);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_generate_secure_password() {
+        let password = generate_secure_password(20);
+        assert_eq!(password.len(), 20);
+
+        let has_upper = password.chars().any(|c| c.is_ascii_uppercase());
+        let has_lower = password.chars().any(|c| c.is_ascii_lowercase());
+        let has_digit = password.chars().any(|c| c.is_ascii_digit());
+        let has_special = password.chars().any(|c| "!@#$%^&*-_=+".contains(c));
+
+        assert!(has_upper, "Password must contain uppercase");
+        assert!(has_lower, "Password must contain lowercase");
+        assert!(has_digit, "Password must contain digit");
+        assert!(has_special, "Password must contain special char");
     }
 }

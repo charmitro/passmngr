@@ -204,6 +204,11 @@ fn run_tui() -> Result<()> {
     )?;
     terminal.show_cursor()?;
 
+    // Clear clipboard on exit (Man-Rated Security: Zeroize sensitive data)
+    if let Err(e) = app.clear_clipboard() {
+        eprintln!("Warning: Failed to clear clipboard: {}", e);
+    }
+
     if let Err(err) = res {
         eprintln!("Error: {}", err);
     }
@@ -211,22 +216,36 @@ fn run_tui() -> Result<()> {
     Ok(())
 }
 
+use std::time::Duration;
+
+// ... (keep imports)
+
 /// Main application loop
 fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
+    const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
+
     loop {
         terminal.draw(|f| ui::render(f, app))?;
+
+        // Check inactivity
+        if app.mode != Mode::Locked && app.last_activity.elapsed() > INACTIVITY_TIMEOUT {
+            app.lock();
+        }
 
         // Handle pending save operation after drawing
         // This ensures "Saving..." status is visible before the blocking operation
         if app.pending_save {
-            app.save()?;
+            if let Err(e) = app.save() {
+                app.set_status(format!("Error saving vault: {}", e));
+                app.pending_save = false; // Reset flag manually if save failed
+            }
         }
 
         if app.should_quit {
             break;
         }
 
-        if event::poll(std::time::Duration::from_millis(16))? {
+        if event::poll(Duration::from_millis(16))? {
             if let Event::Key(key) = event::read()? {
                 handle_key_event(app, key)?;
             }
@@ -241,7 +260,18 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
 
 /// Handle keyboard input based on current mode
 fn handle_key_event(app: &mut App, key: event::KeyEvent) -> Result<()> {
+    use crossterm::event::KeyModifiers;
+
+    // Update activity timestamp for any key press
+    app.touch_activity();
     app.clear_status();
+
+    // Global Signal Trapping: Ctrl+C
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.clear_clipboard()?;
+        app.should_quit = true;
+        return Ok(());
+    }
 
     match app.mode {
         Mode::Normal => handle_normal_mode(app, key)?,
@@ -249,8 +279,31 @@ fn handle_key_event(app: &mut App, key: event::KeyEvent) -> Result<()> {
         Mode::Command => handle_command_mode(app, key)?,
         Mode::Detail => handle_detail_mode(app, key)?,
         Mode::Insert => handle_insert_mode(app, key)?,
+        Mode::Locked => handle_locked_mode(app, key)?,
     }
 
+    Ok(())
+}
+
+/// Handle keys in Locked mode
+fn handle_locked_mode(app: &mut App, key: event::KeyEvent) -> Result<()> {
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => {
+            app.should_quit = true;
+        }
+        KeyCode::Enter => {
+            if app.unlock().is_err() {
+                // Error is already set in status
+            }
+        }
+        KeyCode::Char(c) => {
+            app.unlock_input.push(c);
+        }
+        KeyCode::Backspace => {
+            app.unlock_input.pop();
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -348,6 +401,7 @@ fn handle_detail_mode(app: &mut App, key: event::KeyEvent) -> Result<()> {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.mode = Mode::Normal;
+            app.show_password = false;
         }
         KeyCode::Char('e') => {
             app.enter_edit_mode();
@@ -357,6 +411,9 @@ fn handle_detail_mode(app: &mut App, key: event::KeyEvent) -> Result<()> {
         }
         KeyCode::Char('Y') => {
             app.copy_username_to_clipboard()?;
+        }
+        KeyCode::Char('v') => {
+            app.toggle_password_visibility();
         }
         _ => {}
     }
@@ -372,10 +429,16 @@ fn handle_insert_mode(app: &mut App, key: event::KeyEvent) -> Result<()> {
         KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.save_form();
         }
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.toggle_password_visibility();
+        }
+        KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.generate_password();
+        }
         KeyCode::Esc => {
             app.cancel_form();
         }
-        KeyCode::Tab => {
+        KeyCode::Tab | KeyCode::Enter => {
             app.focused_field = app.focused_field.next();
         }
         KeyCode::BackTab => {

@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Maximum allowed vault file size (10 MiB) to prevent DoS
+const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
 /// Encrypted vault file format
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VaultFile {
@@ -34,6 +37,16 @@ impl VaultFile {
 
     /// Load and decrypt vault from file
     pub fn load(path: &Path, password: &str) -> Result<Vault> {
+        // Check file size
+        let metadata = fs::metadata(path)?;
+        if metadata.len() > MAX_FILE_SIZE {
+            return Err(anyhow!(
+                "Vault file too large: {} bytes (max {})",
+                metadata.len(),
+                MAX_FILE_SIZE
+            ));
+        }
+
         // Read encrypted file
         let contents = fs::read(path)?;
         let vault_file: VaultFile = serde_json::from_slice(&contents)?;
@@ -62,7 +75,7 @@ impl VaultFile {
 
         // Generate new crypto parameters
         let kdf_params = KdfParams::new()?;
-        let cipher_params = CipherParams::new();
+        let cipher_params = CipherParams::new()?;
 
         // Derive key and encrypt
         let key = EncryptionKey::derive(password, &kdf_params)?;
